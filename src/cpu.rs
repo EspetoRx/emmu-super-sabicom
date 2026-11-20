@@ -195,10 +195,6 @@ trait Value:
     + Eq
     + std::fmt::Debug
 {
-    const BITS: u32;
-
-    fn from_u8(v: u8) -> Self;
-
     fn zero(&self) -> bool;
     fn msb(&self) -> bool;
 
@@ -208,13 +204,6 @@ trait Value:
 }
 
 impl Value for u8 {
-    const BITS: u32 = 8;
-
-    #[inline]
-    fn from_u8(v: u8) -> Self {
-        v as Self
-    }
-
     #[inline]
     fn zero(&self) -> bool {
         *self == 0
@@ -234,13 +223,6 @@ impl Value for u8 {
 }
 
 impl Value for u16 {
-    const BITS: u32 = 8;
-
-    #[inline]
-    fn from_u8(v: u8) -> Self {
-        v as Self
-    }
-
     #[inline]
     fn zero(&self) -> bool {
         *self == 0
