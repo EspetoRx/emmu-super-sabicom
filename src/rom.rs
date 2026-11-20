@@ -44,10 +44,9 @@ pub enum Speed {
 
 impl From<u8> for Speed {
     fn from(value: u8) -> Self {
-        match value {
+        match value & 1 {
             0 => Speed::Slow,
-            1 => Speed::Fast,
-            _ => unreachable!(),
+            _ => Speed::Fast,
         }
     }
 }
@@ -233,12 +232,20 @@ fn parse_coprocessor(c: u8, subclass: u8) -> Coprocessor {
 pub enum RomError {
     #[error("invalid rom size")]
     InvalidRomSize,
+    #[error("unsupported rom size: {0:#X}")]
+    UnsupportedRomSize(usize),
     #[error("invalid title string")]
     InvalidTitleString,
     #[error("invalid speed: {0:02X}")]
     InvalidSpeed(u8),
     #[error("invalid map mode: {0:02X}")]
     InvalidMapMode(u8),
+    #[error("unsupported map mode: {0}")]
+    UnsupportedMapMode(String),
+    #[error("unsupported coprocessor: {0}")]
+    UnsupportedCoprocessor(String),
+    #[error("interleaved rom image is not supported")]
+    InterleavedRomNotSupported,
     #[error("invalid chipset code: {0:02X} (sub: {1:02X})")]
     InvalidChipset(u8, u8),
     #[error("invalid rom size code: {0}")]
@@ -259,9 +266,13 @@ impl RomError {
     fn score(&self) -> u32 {
         match self {
             RomError::InvalidRomSize => 10000,
+            RomError::UnsupportedRomSize(_) => 10000,
             RomError::InvalidTitleString => 1,
             RomError::InvalidSpeed(_) => 100,
             RomError::InvalidMapMode(_) => 10,
+            RomError::UnsupportedMapMode(_) => 10000,
+            RomError::UnsupportedCoprocessor(_) => 10000,
+            RomError::InterleavedRomNotSupported => 10000,
             RomError::InvalidChipset(_, _) => 100,
             RomError::InvalidRomSizeCode(_) => 1000,
             RomError::RomSizeDoesNotMatch => 10,
@@ -273,15 +284,54 @@ impl RomError {
     }
 }
 
+fn try_deinterleave_hirom(bytes: &[u8]) -> Option<Vec<u8>> {
+    const CHUNK: usize = 0x80000; // 512 KB
+    if bytes.len() < CHUNK * 2 || bytes.len() % (CHUNK * 2) != 0 {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(bytes.len());
+    for pair in bytes.chunks_exact(CHUNK * 2) {
+        let (first, second) = pair.split_at(CHUNK);
+        out.extend_from_slice(second);
+        out.extend_from_slice(first);
+    }
+    Some(out)
+}
+
 impl Rom {
     pub fn from_bytes(bytes: &[u8]) -> Result<Rom, RomError> {
+        match Self::from_bytes_inner(bytes, true) {
+            Ok(rom) => Ok(rom),
+            Err(RomError::InterleavedRomNotSupported) => {
+                let stripped = if bytes.len() & 0x3FF == 0x200 {
+                    &bytes[0x200..]
+                } else {
+                    bytes
+                };
+                if let Some(deinterleaved) = try_deinterleave_hirom(stripped) {
+                    if let Ok(rom) = Self::from_bytes_inner(&deinterleaved, false) {
+                        return Ok(rom);
+                    }
+                }
+                Err(RomError::InterleavedRomNotSupported)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn from_bytes_inner(bytes: &[u8], allow_deinterleave: bool) -> Result<Rom, RomError> {
         let bytes = if bytes.len() & 0x3FF == 0 {
             bytes
         } else if bytes.len() & 0x3FF == 0x200 {
             &bytes[0x200..]
         } else {
-            Err(RomError::InvalidRomSize)?
+            return Err(RomError::InvalidRomSize);
         };
+
+        if bytes.is_empty() || bytes.len().count_ones() > 2 {
+            return Err(RomError::UnsupportedRomSize(bytes.len()));
+        }
 
         let mut candidates = vec![];
 
@@ -296,7 +346,7 @@ impl Rom {
         }
 
         if candidates.is_empty() {
-            Err(RomError::UnknownRomType)?
+            return Err(RomError::UnknownRomType);
         }
 
         for (_, c) in &candidates {
@@ -306,24 +356,28 @@ impl Rom {
         let (header_pos_first, header) = candidates
             .into_iter()
             .min_by_key(|(_, r)| r.score())
-            .unwrap();
+            .ok_or(RomError::UnknownRomType)?;
+
+        match header.map_mode {
+            MapMode::LoRom | MapMode::HiRom | MapMode::ExHiRom => {}
+            other => return Err(RomError::UnsupportedMapMode(format!("{other:?}"))),
+        }
+
+        if let Some(coprocessor) = &header.chipset.coprocessor {
+            return Err(RomError::UnsupportedCoprocessor(format!("{coprocessor:?}")));
+        }
 
         let interleaved = if header_pos_first {
-            match header.map_mode {
-                MapMode::LoRom => false,
-                _ => true,
-            }
+            !matches!(header.map_mode, MapMode::LoRom)
         } else {
-            match header.map_mode {
-                MapMode::HiRom | MapMode::ExHiRom => false,
-                _ => true,
-            }
+            !matches!(header.map_mode, MapMode::HiRom | MapMode::ExHiRom)
         };
 
         if interleaved {
-            // FIXME: More accurate detection
-            // Maybe interleaved
-            todo!("Interleaved ROM image suport");
+            if allow_deinterleave {
+                return Err(RomError::InterleavedRomNotSupported);
+            }
+            return Err(RomError::InterleavedRomNotSupported);
         }
 
         Ok(Rom {
@@ -335,7 +389,7 @@ impl Rom {
 
 fn try_parse_header(bytes: &[u8], header_pos: usize) -> Result<Header, RomError> {
     if header_pos + 0x100 > bytes.len() {
-        Err(RomError::UnknownRomType)?
+        return Err(RomError::UnknownRomType);
     }
 
     let mut errors = vec![];
@@ -373,7 +427,7 @@ fn try_parse_header(bytes: &[u8], header_pos: usize) -> Result<Header, RomError>
     let rom_size_code = header[0xD7];
     if rom_size_code > 0xD {
         errors.push(RomError::InvalidRomSizeCode(rom_size_code));
-        Err(RomError::InvalidRomSizeCode(rom_size_code))?;
+        return Err(RomError::InvalidRomSizeCode(rom_size_code));
     }
 
     let rom_size = (1 << rom_size_code) * 1024;
@@ -384,7 +438,7 @@ fn try_parse_header(bytes: &[u8], header_pos: usize) -> Result<Header, RomError>
     let ram_size_code = header[0xD8];
     if ram_size_code > 9 {
         errors.push(RomError::InvalidSramSizeCode(ram_size_code));
-        Err(RomError::InvalidSramSizeCode(ram_size_code))?;
+        return Err(RomError::InvalidSramSizeCode(ram_size_code));
     }
 
     let sram_size = if ram_size_code == 0 {

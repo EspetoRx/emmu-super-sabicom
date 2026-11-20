@@ -1,7 +1,7 @@
 use log::info;
 use serde::{Deserialize, Serialize};
 
-use crate::rom::{MapMode, Rom};
+use crate::rom::{MapMode, Rom, RomError};
 
 #[derive(Serialize, Deserialize)]
 pub struct Cartridge {
@@ -20,9 +20,9 @@ enum Mapping {
 }
 
 impl Cartridge {
-    pub fn new(rom: Rom, backup: Option<&[u8]>) -> Self {
+    pub fn try_new(rom: Rom, backup: Option<&[u8]>) -> Result<Self, RomError> {
         if let Some(coprocessor) = &rom.header.chipset.coprocessor {
-            todo!("Coprocessor {coprocessor:?} support");
+            return Err(RomError::UnsupportedCoprocessor(format!("{coprocessor:?}")));
         }
 
         let sram_size = rom.header.sram_size;
@@ -51,9 +51,13 @@ impl Cartridge {
             vec![0; sram_size]
         };
 
-        let mapping = make_mapping(&rom);
+        let mapping = make_mapping(&rom)?;
 
-        Self { rom, sram, mapping }
+        Ok(Self { rom, sram, mapping })
+    }
+
+    pub fn new(rom: Rom, backup: Option<&[u8]>) -> Self {
+        Self::try_new(rom, backup).unwrap_or_else(|err| panic!("{err}"))
     }
 
     pub fn backup(&self) -> Option<Vec<u8>> {
@@ -66,7 +70,7 @@ impl Cartridge {
 
     pub fn restore(&mut self, origin: &mut Cartridge) {
         std::mem::swap(&mut self.rom, &mut origin.rom);
-        self.mapping = make_mapping(&self.rom);
+        self.mapping = make_mapping(&self.rom).unwrap_or_else(|err| panic!("{err}"));
     }
 
     pub fn rom(&self) -> &Rom {
@@ -97,7 +101,7 @@ impl Cartridge {
     }
 }
 
-fn make_mapping(rom: &Rom) -> Vec<Mapping> {
+fn make_mapping(rom: &Rom) -> Result<Vec<Mapping>, RomError> {
     // 2KB page x 0x2000 entries
     let mut mapping = vec![Mapping::None; 0x2000];
     let rom_len = rom.rom.len() as u32;
@@ -105,29 +109,19 @@ fn make_mapping(rom: &Rom) -> Vec<Mapping> {
 
     for bank in 0..=0xFF {
         for page in 0..=0x1F {
-            // FIXME: odd sized ROM
-            let entry = match rom.header.map_mode {
+            let entry = match &rom.header.map_mode {
                 MapMode::LoRom => {
                     let rom_offset = (bank & 0x7F) << 15 | (page & 0xF) << 11;
                     let ram_offset = (bank & 0xF) << 15 | (page & 0xF) << 11;
 
                     match bank as u8 {
                         0x00..=0x3F | 0x80..=0xBF => match (page << 11) as u16 {
-                            0x0000..=0x7FFF => {
-                                // System region
-                                // FIXME: 0x3000..=0x3FFF for DSP and SuperFX?
-                                Mapping::None
-                            }
+                            0x0000..=0x7FFF => Mapping::None,
                             0x8000..=0xFFFF => Mapping::Rom(rom_addr_mask(rom_offset, rom_len)),
                         },
-                        0x40..=0x6F | 0xC0..=0xEF => match (page << 11) as u16 {
-                            0x0000..=0x7FFF => {
-                                // FIXME:
-                                // May be mapped as the higher bank ($8000 - $FFFF) if chip is not MAD-1. Otherwise this area is unused
-                                Mapping::Rom(rom_addr_mask(rom_offset, rom_len))
-                            }
-                            0x8000..=0xFFFF => Mapping::Rom(rom_addr_mask(rom_offset, rom_len)),
-                        },
+                        0x40..=0x6F | 0xC0..=0xEF => {
+                            Mapping::Rom(rom_addr_mask(rom_offset, rom_len))
+                        }
                         0x70..=0x7D | 0xF0..=0xFF => match (page << 11) as u16 {
                             0x0000..=0x7FFF => {
                                 if rom.header.sram_size != 0 {
@@ -149,17 +143,11 @@ fn make_mapping(rom: &Rom) -> Vec<Mapping> {
 
                     match bank as u8 {
                         0x00..=0x1F | 0x80..=0x9F => match (page << 11) as u16 {
-                            0x0000..=0x7FFF => {
-                                // FIXME: 0x3000..=0x3FFF for DSP and SuperFX?
-                                Mapping::None
-                            }
+                            0x0000..=0x7FFF => Mapping::None,
                             0x8000..=0xFFFF => Mapping::Rom(rom_addr_mask(rom_offset, rom_len)),
                         },
                         0x20..=0x3F | 0xA0..=0xBF => match (page << 11) as u16 {
-                            0x0000..=0x5FFF => {
-                                // FIXME: 0x3000..=0x3FFF for DSP and SuperFX?
-                                Mapping::None
-                            }
+                            0x0000..=0x5FFF => Mapping::None,
                             0x6000..=0x7FFF => {
                                 if rom.header.sram_size != 0 {
                                     Mapping::Ram(ram_addr_mask(ram_offset, ram_len))
@@ -174,17 +162,14 @@ fn make_mapping(rom: &Rom) -> Vec<Mapping> {
                         0x7E..=0x7F => Mapping::None,
                     }
                 }
-                MapMode::Sdd1 => todo!("S-DD1 memory mapping"),
-                MapMode::Sa1 => todo!("SA-1 memory mapping"),
-                MapMode::Spc7110 => todo!("SPC7110 memory mapping"),
-                MapMode::Unknown(_) => panic!("Unknown memory mapping"),
+                other => return Err(RomError::UnsupportedMapMode(format!("{other:?}"))),
             };
 
             mapping[((bank << 5) | page) as usize] = entry;
         }
     }
 
-    mapping
+    Ok(mapping)
 }
 
 fn rom_addr_mask(addr: u32, len: u32) -> u32 {

@@ -58,7 +58,8 @@ impl EmulatorCore for Snes {
         backup: Option<&[u8]>,
         _config: &Self::Config,
     ) -> Result<Self, Self::Error> {
-        Ok(Snes::new(rom::Rom::from_bytes(&data)?, backup))
+        let rom = rom::Rom::from_bytes(data)?;
+        Ok(Snes::new(rom, backup))
     }
 
     fn game_info(&self) -> Vec<(String, String)> {
